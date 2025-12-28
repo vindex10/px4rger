@@ -1,0 +1,20 @@
+[project]
+name = "aviant"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anyio>=4.12.0",
+    "mavsdk>=3.10.2",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.12.0",
+    "requests>=2.32.5",
+]
+
+[dependency-groups]
+dev = [
+    "aioconsole>=0.8.2",
+    "ipdb>=0.13.13",
+    "ty>=0.0.7",
+]
