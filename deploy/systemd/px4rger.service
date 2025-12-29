@@ -1,0 +1,19 @@
+[Unit]
+Description=PX4rger
+After=network.target
+
+[Service]
+Type=oneshot
+User=vindex10
+WorkingDirectory=/tmp/
+Environment=AVNT_SKIP_VERSION_CHECK=True AVNT_LOGLEVEL=DEBUG VIRTUAL_ENV=/home/vindex10/projects/arc/workdir/aviant/.venv
+ExecStart=/home/vindex10/.local/bin/uv run /home/vindex10/projects/arc/workdir/aviant/main.py
+# Timeout settings
+TimeoutStopSec=20
+TimeoutStartSec=60
+# Send SIGKILL if SIGTERM doesn't work
+KillMode=mixed
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

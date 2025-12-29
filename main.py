@@ -1,5 +1,7 @@
+import logging
 import os
 import requests
+import pydantic
 import math
 from collections import defaultdict
 import asyncio
@@ -13,16 +15,18 @@ from mavsdk.server_utility import StatusTextType
 LAST_VERSION_STATE = "version.state"
 FLOAT_TOLERANCE = 6
 REL_FLOAT_TOLERANCE = 10**-FLOAT_TOLERANCE
-REAPPLICATION_TIMEOUT = 2
+REAPPLICATION_TIMEOUT = 2.0
 MAX_REAPPLICATIONS = 5
 
 
-class InAir(Exception):
-    pass
+def init_logging(loglevel: int):
+    logging.basicConfig(
+        level=loglevel,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 
 
-class NotArmable(Exception):
-    pass
+LOG = logging.getLogger(__name__)
 
 
 class Config(BaseSettings):
@@ -36,6 +40,15 @@ class Config(BaseSettings):
         description="Connection string (e.g. udpin://0.0.0.0:14540)",
     )
     skip_version_check: bool = False
+    loglevel: int = logging.INFO
+
+    @pydantic.field_validator("loglevel", mode="before")
+    @classmethod
+    def validate_loglevel(cls, v):
+        levels = ["CRITICAL", "FATAL", "ERROR", "WARNING", "WARN", "INFO", "DEBUG"]
+        if v in levels:
+            return getattr(logging, v)
+        return int(v)
 
     model_config = SettingsConfigDict(cli_parse_args=True, env_prefix="AVNT_")
 
@@ -55,41 +68,39 @@ class Param[T](BaseModel):
 
 
 async def main(args: Config):
+    init_logging(args.loglevel)
     version, params = read_param_file(args.param_file)
     if not args.skip_version_check and not version_is_new(version):
-        print(f"Version {version} didn't change")
+        LOG.info("Version %s didn't change. Exit.", version)
         return
+    # sitl fix
     params = {k: _skip_settings(v) for k, v in params.items()}
     for component, component_params in params.items():
-        try:
-            await process_component_or_revert(
-                component, component_params, args.connection
-            )
-        except NotArmable:
-            print("NotArmable. Reverted")
+        drone = System(sysid=component.vehicle_id, compid=component.component_id)
+        await drone.connect(system_address=args.connection)
+        if await check_in_air(drone):
+            LOG.debug("InAir. Exit unfinished.")
             return
-        except InAir:
-            print("InAir. Skipped")
-            return
+        await process_component_or_revert(drone, component_params)
+        await show_popup(drone, "Finished updating params")
+        LOG.info("Finished updating params")
+        # mavsdk is cleaned up too quick, give time to send the notification
+        await asyncio.sleep(2.0)
     if not args.skip_version_check:
         save_version(version)
-    print(f"Updated to version {version}.")
+    LOG.info("Updated params to version %s.", version)
 
 
-async def process_component_or_revert(
-    component: Component, component_params: list[Param], addr: str
-):
-    drone = System(sysid=component.vehicle_id, compid=component.component_id)
-    await drone.connect(system_address=addr)
-    current_params = list((await read_param_spec(drone)).values())
+async def process_component_or_revert(drone: System, component_params: list[Param]):
+    await show_popup(drone, "Updating params. Do not take off.")
+    old_params = list((await read_drone_params(drone)).values())
     await process_component_until_complete(drone, component_params)
-    try:
-        await check_is_armable(drone)
-    except NotArmable as e:
-        # revert
-        print("Reverting")
-        await process_component_until_complete(drone, current_params)
-        raise e
+    if await check_is_armable(drone):
+        return
+    # not armable, revert
+    LOG.warning("Not armable. Reverting")
+    await show_popup(drone, "Not armable, reverting. Do not take off.")
+    await process_component_until_complete(drone, old_params)
 
 
 async def process_component_until_complete(
@@ -97,29 +108,27 @@ async def process_component_until_complete(
 ):
     # Re-apply parameters until no changes neccessary
     for _ in range(MAX_REAPPLICATIONS):
-        changed_params = await _process_one_time(drone, component_params)
+        changed_params = await _set_params_once(drone, component_params)
         if not changed_params:
             return
-        print(f"Wait {REAPPLICATION_TIMEOUT} sec before reapplying")
+        LOG.info("Wait %s sec before reapplying", REAPPLICATION_TIMEOUT)
+        # wait if new parameters emerge after settings have changed
         await asyncio.sleep(REAPPLICATION_TIMEOUT)
 
 
-async def _process_one_time(drone: System, new_params: list[Param]):
-    await check_in_air(drone)
-    current_params = await read_param_spec(drone)
-    old_values, changed_params = find_changed_params(current_params, new_params)
+async def _set_params_once(drone: System, new_params: list[Param]) -> list[Param]:
+    current_params = await read_drone_params(drone)
+    changed_params = find_changed_params(current_params, new_params)
     if not changed_params:
         # nothing to update for the component
         return changed_params
-    await notify_changed_params(drone, old_values, changed_params)
     await set_params(drone, changed_params)
     return changed_params
 
 
 def find_changed_params(
     current_params: dict[str, Param], new_params: list[Param]
-) -> tuple[list[Param], list[Param]]:
-    old_values = []
+) -> list[Param]:
     changed_params = []
     for p in new_params:
         if (current_param := current_params.get(p.name)) is None:
@@ -129,9 +138,8 @@ def find_changed_params(
         if _params_equal(validated_param, current_param):
             # value didn't change
             continue
-        old_values.append(current_param)
         changed_params.append(validated_param)
-    return (old_values, changed_params)
+    return changed_params
 
 
 def _params_equal(a: Param, b: Param):
@@ -158,7 +166,7 @@ def read_file_from_url(url: str):
 
 def read_file_from_fs(path: str):
     with open(path, "r", encoding="utf-8") as param_file:
-        return param_file.read().split("\n")
+        return param_file.read().strip().split("\n")
 
 
 def parse_param_file(lines: Iterable[str]) -> tuple[str, dict[Component, list[Param]]]:
@@ -187,7 +195,7 @@ def parse_param_file(lines: Iterable[str]) -> tuple[str, dict[Component, list[Pa
     return version, res
 
 
-async def read_param_spec(drone: System) -> dict[str, Param]:
+async def read_drone_params(drone: System) -> dict[str, Param]:
     params = await drone.param.get_all_params()
     res = {}
     for p in params.int_params:
@@ -209,14 +217,16 @@ async def set_params(drone: System, params: list[Param]):
             await drone.param.set_param_custom(param.name, param.value)
         else:
             raise ValueError("Unknown param type")
-        print(f"Set param `{param.name}` to value: `{param.value}`")
+        LOG.debug("Set param `%s` to value: %s", param.name, param.value)
+    LOG.info("Set %s params", len(params))
 
 
 async def check_in_air(drone: System):
-    async for is_in_air in drone.telemetry.in_air():
-        if not is_in_air:
-            return
-    raise InAir()
+    is_in_air = True
+    async for upd_is_in_air in drone.telemetry.in_air():
+        is_in_air = upd_is_in_air
+        break
+    return is_in_air
 
 
 async def check_is_armable(drone: System):
@@ -224,37 +234,11 @@ async def check_is_armable(drone: System):
     async for health in drone.telemetry.health():
         is_armable = health.is_armable
         break
-    if not is_armable:
-        raise NotArmable()
+    return is_armable
 
 
-async def notify_changed_params(
-    drone: System, old_params: list[Param], changed_params: list[Param]
-):
-    if not changed_params:
-        return
-    if len(changed_params) == 1:
-        old_param = old_params[0]
-        new_param = changed_params[0]
-        await drone.server_utility.send_status_text(
-            StatusTextType.ERROR,
-            f"{new_param.name}: chng {old_param.value} -> {new_param.value}",
-        )
-        return
-    await drone.server_utility.send_status_text(
-        StatusTextType.ERROR, f"updating {len(changed_params)} params"
-    )
-    if len(changed_params) <= 5:
-        for old_param, new_param in zip(old_params, changed_params):
-            await drone.server_utility.send_status_text(
-                StatusTextType.INFO,
-                f"{new_param.name}: chng {old_param.value} -> {new_param.value}",
-            )
-            await asyncio.sleep(0.1)
-
-
-async def send_status_text(drone: System, severity: StatusTextType, msg: str):
-    await drone.server_utility.send_status_text(severity, msg)
+async def show_popup(drone: System, msg: str):
+    await drone.server_utility.send_status_text(StatusTextType.ERROR, msg)
 
 
 def version_is_new(version):

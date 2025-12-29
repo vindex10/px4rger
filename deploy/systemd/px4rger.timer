@@ -1,0 +1,11 @@
+[Unit]
+Description=Run px4rger every 10 seconds
+Requires=px4rger.service
+
+[Timer]
+OnBootSec=10s
+OnCalendar=*:*:0/10
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
