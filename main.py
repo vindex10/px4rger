@@ -79,11 +79,13 @@ async def main(args: Config):
         drone = System(sysid=component.vehicle_id, compid=component.component_id)
         await drone.connect(system_address=args.connection)
         if await check_in_air(drone):
-            LOG.debug("InAir. Exit unfinished.")
+            LOG.info("InAir. Exit immediately.")
             return
+        await show_popup(drone, f"Updating params. Do not take off. {component}")
+        LOG.info("Updating params %s", component)
         await process_component_or_revert(drone, component_params)
-        await show_popup(drone, "Finished updating params")
-        LOG.info("Finished updating params")
+        await show_popup(drone, f"Finished updating params. {component}")
+        LOG.info("Finished updating params %s", component)
         # mavsdk is cleaned up too quick, give time to send the notification
         await asyncio.sleep(2.0)
     if not args.skip_version_check:
@@ -92,7 +94,6 @@ async def main(args: Config):
 
 
 async def process_component_or_revert(drone: System, component_params: list[Param]):
-    await show_popup(drone, "Updating params. Do not take off.")
     old_params = list((await read_drone_params(drone)).values())
     await process_component_until_complete(drone, component_params)
     if await check_is_armable(drone):
