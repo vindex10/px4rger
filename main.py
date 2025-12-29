@@ -81,13 +81,13 @@ async def process_component_or_revert(
 ):
     drone = System(sysid=component.vehicle_id, compid=component.component_id)
     await drone.connect(system_address=addr)
+    current_params = list((await read_param_spec(drone)).values())
+    await process_component_until_complete(drone, component_params)
     try:
-        current_params = list((await read_param_spec(drone)).values())
-        await process_component_until_complete(drone, component_params)
+        await check_is_armable(drone)
     except NotArmable as e:
         # revert
         print("Reverting")
-        await drone.connect(system_address=addr)
         await process_component_until_complete(drone, current_params)
         raise e
 
@@ -102,7 +102,6 @@ async def process_component_until_complete(
             return
         print(f"Wait {REAPPLICATION_TIMEOUT} sec before reapplying")
         await asyncio.sleep(REAPPLICATION_TIMEOUT)
-        await check_is_armable(drone)
 
 
 async def _process_one_time(drone: System, new_params: list[Param]):
@@ -164,7 +163,7 @@ def read_file_from_fs(path: str):
 
 def parse_param_file(lines: Iterable[str]) -> tuple[str, dict[Component, list[Param]]]:
     res = defaultdict(list)
-    version = None
+    version = ""
     for line in lines:
         if line.startswith("#"):
             if "Version" in line:
@@ -213,7 +212,7 @@ async def set_params(drone: System, params: list[Param]):
         print(f"Set param `{param.name}` to value: `{param.value}`")
 
 
-async def check_in_air(drone: System) -> bool:
+async def check_in_air(drone: System):
     async for is_in_air in drone.telemetry.in_air():
         if not is_in_air:
             return
